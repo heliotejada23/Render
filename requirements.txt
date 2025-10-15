@@ -1,16 +1,8 @@
 fastapi
 uvicorn
 requests
-
-openai
-
-google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
-
-openai>=1.0.0
-
-torch
+git+https://github.com/openai/whisper.git
+torch --extra-index-url https://download.pytorch.org/whl/cpu
 
 
 
