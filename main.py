@@ -84,9 +84,13 @@ async def telegram_webhook(update: TelegramUpdate):
             # Enviamos el audio a la API de Hugging Face
             response = requests.post(
                 HF_MODEL_URL,
-                headers={"Authorization": f"Bearer {HF_TOKEN}"},
-                files={"file": ("audio.ogg", audio_data, "audio/ogg")}
+                headers={
+                "Authorization": f"Bearer {HF_TOKEN}",
+                "Content-Type": "audio/ogg"
+                },
+                data=audio_data
             )
+
 
             # Procesamos la respuesta
             if response.status_code == 200:
@@ -121,4 +125,5 @@ async def telegram_webhook(update: TelegramUpdate):
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Bot de Telegram + Whisper + Hugging Face activo 🚀"}
+
 
