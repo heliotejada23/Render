@@ -10,6 +10,9 @@ from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 import dateparser
 
+import re
+from datetime import datetime
+
 # -------------------------------------------------------------
 # CONFIGURACIÓN
 # -------------------------------------------------------------
@@ -85,6 +88,23 @@ def get_user_timezone() -> str:
 # DETECCIÓN DE FECHAS Y TAREAS
 # -------------------------------------------------------------
 def parse_datetime_from_text(text: str, tz: str) -> datetime | None:
+    """
+    Detecta fecha/hora en español con tolerancia a errores y expresiones comunes.
+    """
+    original_text = text
+    text = text.lower()
+
+    # Correcciones básicas de palabras sin tilde
+    replacements = {
+        "manana": "mañana",
+        "pasado manana": "pasado mañana",
+        "miercoles": "miércoles",
+        "sabado": "sábado",
+    }
+    for wrong, correct in replacements.items():
+        text = text.replace(wrong, correct)
+
+    # Intento 1: usar dateparser normalmente
     dt = dateparser.parse(
         text,
         languages=["es"],
@@ -94,7 +114,46 @@ def parse_datetime_from_text(text: str, tz: str) -> datetime | None:
             "RETURN_AS_TIMEZONE_AWARE": True,
         },
     )
-    return dt
+    if dt:
+        print(f"✅ dateparser reconoció fecha/hora: {dt}")
+        return dt
+
+    # Intento 2: expresiones comunes tipo "mañana", "pasado mañana"
+    now = datetime.now(ZoneInfo(tz))
+    if "pasado mañana" in text:
+        return now + timedelta(days=2)
+    if "mañana" in text:
+        return now + timedelta(days=1)
+    if "hoy" in text:
+        return now
+
+    # Intento 3: día de la semana (“lunes”, “viernes”, etc.)
+    weekdays = {
+        "lunes": 0, "martes": 1, "miércoles": 2, "miercoles": 2,
+        "jueves": 3, "viernes": 4, "sábado": 5, "sabado": 5, "domingo": 6
+    }
+    for day_name, day_num in weekdays.items():
+        if day_name in text:
+            days_ahead = (day_num - now.weekday() + 7) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            target = now + timedelta(days=days_ahead)
+            print(f"✅ Detectado día de la semana: {day_name} → {target}")
+            return target
+
+    # Intento 4: hora simple (“a las 9”, “a las 10:30”)
+    match = re.search(r"a las (\d{1,2})(?:[:\.](\d{1,2}))?", text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2)) if match.group(2) else 0
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate < now:
+            candidate += timedelta(days=1)
+        print(f"✅ Detectada hora sin fecha: {candidate}")
+        return candidate
+
+    print(f"⚠️ No se encontró fecha/hora en: {original_text}")
+    return None
 
 def classify_intent(text: str) -> str:
     t = text.lower()
@@ -226,3 +285,4 @@ async def telegram_webhook(update: TelegramUpdate):
 @app.get("/")
 def root():
     return {"status": "ok", "message": "🤖 Bot Telegram + Whisper + Calendar con zona horaria automática 🚀"}
+
