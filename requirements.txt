@@ -11,6 +11,8 @@ google-auth-oauthlib
 openai>=1.0.0
 
 torch
+torch==2.0.0
+
 
 
 
