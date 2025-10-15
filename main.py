@@ -14,7 +14,8 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
 
 # URL del modelo gratuito de Whisper
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/Systran/faster-whisper-small"
+HF_MODEL_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
+
 
 
 
@@ -122,6 +123,7 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         print("⚠️ Error general en webhook:", e)
         return {"ok": False, "error": str(e)}
+
 
 
 
