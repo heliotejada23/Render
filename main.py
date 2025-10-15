@@ -52,3 +52,25 @@ async def telegram_webhook(request: Request):
             })
 
     return {"ok": True}
+
+
+
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+
+def crear_evento_google_calendar(titulo, inicio, fin, descripcion=""):
+    creds = Credentials.from_authorized_user_file('token.json', ['https://www.googleapis.com/auth/calendar'])
+    service = build('calendar', 'v3', credentials=creds)
+
+    evento = {
+        'summary': titulo,
+        'description': descripcion,
+        'start': {'dateTime': inicio, 'timeZone': 'America/Mexico_City'},
+        'end': {'dateTime': fin, 'timeZone': 'America/Mexico_City'},
+    }
+
+    evento_creado = service.events().insert(calendarId='primary', body=evento).execute()
+    print(f"Evento creado: {evento_creado.get('htmlLink')}")
+    return evento_creado
+
+
