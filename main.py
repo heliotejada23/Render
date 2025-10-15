@@ -22,12 +22,24 @@ def send_message(chat_id: int, text: str):
     requests.post(url, json=payload)
 
 def download_file(file_id: str):
-    """Descarga un archivo de Telegram"""
+    """Descarga un archivo de Telegram de manera segura"""
     file_info_url = f"https://api.telegram.org/bot{TELEGRAM_API}/getFile?file_id={file_id}"
     file_info = requests.get(file_info_url).json()
+
+    if not file_info.get("ok") or "result" not in file_info:
+        print(f"⚠️ Error al obtener archivo de Telegram: {file_info}")
+        raise Exception("No se pudo obtener la información del archivo desde Telegram")
+
     file_path = file_info["result"]["file_path"]
     file_url = f"https://api.telegram.org/file/bot{TELEGRAM_API}/{file_path}"
-    return requests.get(file_url).content
+    response = requests.get(file_url)
+
+    if response.status_code != 200:
+        print(f"⚠️ Error al descargar archivo desde Telegram: {response.status_code}")
+        raise Exception("No se pudo descargar el archivo de Telegram")
+
+    return response.content
+
 
 # -------------------------------------------------------------
 # ESTRUCTURA DE DATOS
@@ -109,3 +121,4 @@ async def telegram_webhook(update: TelegramUpdate):
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Bot de Telegram + Whisper + Hugging Face activo 🚀"}
+
