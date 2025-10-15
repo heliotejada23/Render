@@ -1,76 +1,80 @@
 from fastapi import FastAPI, Request
 import requests
-import openai
 import os
+from openai import OpenAI
 
+# Inicializamos la app de FastAPI
 app = FastAPI()
 
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")  # lo tomará de las variables de Render
+# Configura tus variables de entorno en Render:
+# TELEGRAM_TOKEN y OPENAI_API_KEY
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Cliente moderno de OpenAI (nuevo SDK)
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# API base de Telegram
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Endpoint raíz opcional (para evitar error 404 al abrir la URL)
+@app.get("/")
+async def root():
+    return {"message": "🤖 Bot de Telegram con Whisper y FastAPI activo!"}
+
+# Endpoint principal del Webhook
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    data = await request.json()
-    message = data.get("message", {})
+    try:
+        data = await request.json()
+        print("📩 Nuevo mensaje recibido:", data)  # Log útil en Render
 
-    # Si el usuario envía un audio (nota de voz)
-    if "voice" in message:
+        if "message" not in data:
+            return {"ok": True}
+
+        message = data["message"]
         chat_id = message["chat"]["id"]
-        file_id = message["voice"]["file_id"]
 
-        # Descarga del archivo de Telegram
-        file_info = requests.get(f"{TELEGRAM_API}/getFile?file_id={file_id}").json()
-        file_path = file_info["result"]["file_path"]
-        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        # Si el mensaje tiene audio o nota de voz
+        if "voice" in message:
+            file_id = message["voice"]["file_id"]
 
-        # Guardar el audio temporalmente
-        audio_data = requests.get(file_url).content
-        with open("audio.ogg", "wb") as f:
-            f.write(audio_data)
+            # 1️⃣ Obtener la ruta del archivo desde Telegram
+            file_info = requests.get(f"{TELEGRAM_API}/getFile?file_id={file_id}").json()
+            file_path = file_info["result"]["file_path"]
+            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
 
-        # Transcripción con Whisper
-        with open("audio.ogg", "rb") as audio_file:
-            transcript = openai.Audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
-        text = transcript.text
+            # 2️⃣ Descargar el audio
+            audio_data = requests.get(file_url).content
+            audio_path = "audio.ogg"
+            with open(audio_path, "wb") as f:
+                f.write(audio_data)
 
-        # Respuesta al usuario
-        requests.post(f"{TELEGRAM_API}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": f"🎙️ Entendí: {text}"
-        })
+            # 3️⃣ Transcribir el audio con Whisper
+            with open(audio_path, "rb") as audio_file:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file
+                )
 
-    else:
-        # Si no hay audio, solo responde un mensaje base
-        chat_id = message.get("chat", {}).get("id")
-        if chat_id:
+            texto = transcript.text
+            print(f"🎧 Transcripción: {texto}")
+
+            # 4️⃣ Responder al usuario con el texto
             requests.post(f"{TELEGRAM_API}/sendMessage", json={
                 "chat_id": chat_id,
-                "text": "Envíame un audio y lo transcribiré 🎧"
+                "text": f"🎙️ Esto fue lo que entendí:\n\n{texto}"
             })
 
-    return {"ok": True}
+        else:
+            # Si el usuario no envía audio
+            requests.post(f"{TELEGRAM_API}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": "👋 Envíame una nota de voz y la transcribiré con Whisper."
+            })
 
+        return {"ok": True}
 
-
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-
-def crear_evento_google_calendar(titulo, inicio, fin, descripcion=""):
-    creds = Credentials.from_authorized_user_file('token.json', ['https://www.googleapis.com/auth/calendar'])
-    service = build('calendar', 'v3', credentials=creds)
-
-    evento = {
-        'summary': titulo,
-        'description': descripcion,
-        'start': {'dateTime': inicio, 'timeZone': 'America/Mexico_City'},
-        'end': {'dateTime': fin, 'timeZone': 'America/Mexico_City'},
-    }
-
-    evento_creado = service.events().insert(calendarId='primary', body=evento).execute()
-    print(f"Evento creado: {evento_creado.get('htmlLink')}")
-    return evento_creado
-
-
+    except Exception as e:
+        print("⚠️ Error en webhook:", e)
+        return {"ok": False, "error": str(e)}
