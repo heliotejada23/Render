@@ -4,6 +4,8 @@ import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 import dateparser
@@ -15,6 +17,7 @@ TELEGRAM_API = os.getenv("TELEGRAM_API")
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
 HF_MODEL_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
 
+# Carga de credenciales de Google
 GOOGLE_TOKEN = os.getenv("GOOGLE_TOKEN_JSON")
 if GOOGLE_TOKEN:
     creds = Credentials.from_authorized_user_info(json.loads(GOOGLE_TOKEN))
@@ -23,6 +26,7 @@ else:
         creds = Credentials.from_authorized_user_info(json.load(f))
 
 calendar_service = build("calendar", "v3", credentials=creds)
+DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Europe/Madrid")
 
 app = FastAPI()
 
@@ -30,94 +34,119 @@ app = FastAPI()
 # FUNCIONES AUXILIARES
 # -------------------------------------------------------------
 def send_message(chat_id: int, text: str):
-    """Envía un mensaje de texto a Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_API}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    requests.post(url, json=payload)
+    requests.post(url, json={"chat_id": chat_id, "text": text})
 
-def download_file(file_id: str):
-    """Descarga un archivo de voz desde Telegram"""
+def download_file(file_id: str) -> bytes:
     file_info_url = f"https://api.telegram.org/bot{TELEGRAM_API}/getFile?file_id={file_id}"
     file_info = requests.get(file_info_url).json()
-
     if not file_info.get("ok") or "result" not in file_info:
-        raise Exception(f"Error obteniendo archivo Telegram: {file_info}")
-
+        raise Exception(f"Error obteniendo archivo de Telegram: {file_info}")
     file_path = file_info["result"]["file_path"]
     file_url = f"https://api.telegram.org/file/bot{TELEGRAM_API}/{file_path}"
-    response = requests.get(file_url)
+    resp = requests.get(file_url)
+    if resp.status_code != 200:
+        raise Exception(f"Error al descargar audio: {resp.status_code}")
+    return resp.content
 
-    if response.status_code != 200:
-        raise Exception(f"Error al descargar audio: {response.status_code}")
-
-    return response.content
-
-def transcribe_audio(audio_data: bytes):
-    """Envía audio a Whisper (Hugging Face) y devuelve el texto"""
-    response = requests.post(
+def transcribe_audio(audio_data: bytes) -> str:
+    resp = requests.post(
         HF_MODEL_URL,
         headers={
             "Authorization": f"Bearer {HF_TOKEN}",
-            "Content-Type": "audio/ogg"
+            "Content-Type": "audio/ogg",
         },
-        data=audio_data
+        data=audio_data,
+        timeout=120,
     )
-
-    if response.status_code != 200:
-        raise Exception(f"Error desde Hugging Face: {response.text}")
-
-    result = response.json()
+    if resp.status_code != 200:
+        raise Exception(f"Error desde Hugging Face: {resp.text}")
+    result = resp.json()
     text = result.get("text")
-    if not text and isinstance(result, list) and len(result) > 0 and "text" in result[0]:
+    if not text and isinstance(result, list) and result and "text" in result[0]:
         text = result[0]["text"]
-    return text or ""
+    return (text or "").strip()
 
 # -------------------------------------------------------------
-# INTELIGENCIA DE FECHAS Y TAREAS
+# ZONA HORARIA
 # -------------------------------------------------------------
-def parse_datetime_from_text(text: str):
-    """Detecta fecha y hora en lenguaje natural (en español)"""
-    parsed_date = dateparser.parse(
+def get_user_timezone() -> str:
+    """Obtiene la zona horaria del usuario desde Google Calendar"""
+    try:
+        settings = calendar_service.settings().get(setting='timezone').execute()
+        tz = settings.get("value")
+        if tz:
+            return tz
+    except Exception as e:
+        print(f"⚠️ No se pudo leer timezone de Google: {e}")
+    return DEFAULT_TZ
+
+# -------------------------------------------------------------
+# DETECCIÓN DE FECHAS Y TAREAS
+# -------------------------------------------------------------
+def parse_datetime_from_text(text: str, tz: str) -> datetime | None:
+    dt = dateparser.parse(
         text,
         languages=["es"],
-        settings={"PREFER_DATES_FROM": "future"}
+        settings={
+            "PREFER_DATES_FROM": "future",
+            "TIMEZONE": tz,
+            "RETURN_AS_TIMEZONE_AWARE": True,
+        },
     )
-    return parsed_date
+    return dt
 
-def detect_event_type(text: str):
-    """Determina si es evento o tarea"""
+def classify_intent(text: str) -> str:
     t = text.lower()
-    if any(w in t for w in ["reunión", "cita", "evento", "llamada", "videollamada", "entrega"]):
-        return "evento"
-    elif any(w in t for w in ["recordatorio", "tarea", "hacer", "pendiente"]):
-        return "tarea"
-    return "evento"  # Por defecto
+    if any(w in t for w in ["tarea", "recordatorio", "pendiente", "hacer", "recordarme", "recuerdame", "recuérdame"]):
+        return "task"
+    if any(w in t for w in ["reunión", "cita", "evento", "llamada", "videollamada", "quedar"]):
+        return "event"
+    return "event"
 
-def create_calendar_event(summary, start_time):
-    """Crea un evento en Google Calendar"""
+def ensure_time(dt: datetime | None, tz: str, default_hour: int = 9, default_minute: int = 0) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo(tz))
+    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
+        dt = dt.replace(hour=default_hour, minute=default_minute)
+    return dt
+
+# -------------------------------------------------------------
+# CREACIÓN DE EVENTOS Y TAREAS
+# -------------------------------------------------------------
+def create_calendar_event(summary: str, start_dt: datetime, tz: str, duration_minutes: int = 30) -> str | None:
     try:
-        end_time = start_time + timedelta(minutes=30)
-        event = {
-            "summary": summary.capitalize(),
-            "start": {"dateTime": start_time.isoformat(), "timeZone": "Europe/Madrid"},
-            "end": {"dateTime": end_time.isoformat(), "timeZone": "Europe/Madrid"},
+        end_dt = start_dt + timedelta(minutes=duration_minutes)
+        body = {
+            "summary": summary.strip().capitalize(),
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": tz},
+            "end": {"dateTime": end_dt.isoformat(), "timeZone": tz},
         }
-        created = calendar_service.events().insert(calendarId="primary", body=event).execute()
+        created = calendar_service.events().insert(calendarId="primary", body=body).execute()
         print(f"✅ Evento creado: {created.get('htmlLink')}")
         return created.get("htmlLink")
     except Exception as e:
         print(f"⚠️ Error al crear evento: {e}")
         return None
 
-def create_calendar_task(summary, due_time):
-    """Crea una tarea como evento de día completo"""
+def create_calendar_task(summary: str, due_dt: datetime, tz: str) -> str | None:
     try:
-        event = {
-            "summary": f"Tarea: {summary.capitalize()}",
-            "start": {"date": due_time.date().isoformat()},
-            "end": {"date": (due_time.date() + timedelta(days=1)).isoformat()},
-        }
-        created = calendar_service.events().insert(calendarId="primary", body=event).execute()
+        if due_dt.hour == 0 and due_dt.minute == 0 and due_dt.second == 0:
+            body = {
+                "summary": f"Tarea: {summary.strip().capitalize()}",
+                "start": {"date": due_dt.date().isoformat()},
+                "end": {"date": (due_dt.date() + timedelta(days=1)).isoformat()},
+            }
+        else:
+            end_dt = due_dt + timedelta(minutes=30)
+            body = {
+                "summary": f"Tarea: {summary.strip().capitalize()}",
+                "start": {"dateTime": due_dt.isoformat(), "timeZone": tz},
+                "end": {"dateTime": end_dt.isoformat(), "timeZone": tz},
+            }
+        created = calendar_service.events().insert(calendarId="primary", body=body).execute()
         print(f"✅ Tarea creada: {created.get('htmlLink')}")
         return created.get("htmlLink")
     except Exception as e:
@@ -125,7 +154,7 @@ def create_calendar_task(summary, due_time):
         return None
 
 # -------------------------------------------------------------
-# ESTRUCTURA TELEGRAM
+# TELEGRAM
 # -------------------------------------------------------------
 class TelegramUpdate(BaseModel):
     update_id: int
@@ -140,45 +169,60 @@ async def telegram_webhook(update: TelegramUpdate):
     chat_id = message["chat"]["id"]
     print(f"📩 Mensaje recibido: {message}")
 
-    # --- Mensaje de texto ---
+    tz = get_user_timezone()
+    print(f"🕒 Timezone detectada: {tz}")
+
+    # --- Texto ---
     if "text" in message:
-        text = message["text"]
-        send_message(chat_id, f"📝 Entendido: {text}")
+        text = message["text"].strip()
+        intent = classify_intent(text)
+        parsed = parse_datetime_from_text(text, tz)
+        parsed = ensure_time(parsed, tz, 10 if intent == "event" else 9)
 
-        event_type = detect_event_type(text)
-        parsed_time = parse_datetime_from_text(text)
-
-        if parsed_time:
-            if event_type == "evento":
-                link = create_calendar_event(text, parsed_time)
-                send_message(chat_id, f"📅 Evento creado: {link}")
+        if parsed:
+            if intent == "event":
+                link = create_calendar_event(text, parsed, tz)
+                send_message(chat_id, f"📅 Evento creado ({tz}):\n🔗 {link}" if link else "⚠️ No pude crear el evento.")
             else:
-                link = create_calendar_task(text, parsed_time)
-                send_message(chat_id, f"✅ Tarea añadida al calendario: {link}")
+                link = create_calendar_task(text, parsed, tz)
+                send_message(chat_id, f"✅ Tarea creada ({tz}):\n🔗 {link}" if link else "⚠️ No pude crear la tarea.")
         else:
-            send_message(chat_id, "⚠️ No encontré una fecha u hora en tu mensaje.")
+            send_message(chat_id, "⚠️ No encontré fecha u hora. Dime algo como: 'reunión mañana a las 10'.")
 
-    # --- Mensaje de voz ---
+    # --- Audio ---
     elif "voice" in message:
-        voice = message["voice"]
-        file_id = voice["file_id"]
-        duration = voice.get("duration", 0)
-
-        send_message(chat_id, "🎧 Procesando tu nota de voz...")
-
         try:
+            send_message(chat_id, "🎧 Procesando tu nota de voz...")
+            file_id = message["voice"]["file_id"]
             audio_data = download_file(file_id)
             text = transcribe_audio(audio_data)
-
             if not text:
                 send_message(chat_id, "⚠️ No pude transcribir el audio.")
                 return {"ok": True}
 
             send_message(chat_id, f"🗣️ He entendido: {text}")
+            intent = classify_intent(text)
+            parsed = parse_datetime_from_text(text, tz)
+            parsed = ensure_time(parsed, tz, 10 if intent == "event" else 9)
 
-            event_type = detect_event_type(text)
-            parsed_time = parse_datetime_from_text(text)
+            if parsed:
+                if intent == "event":
+                    link = create_calendar_event(text, parsed, tz)
+                    send_message(chat_id, f"📅 Evento creado ({tz}):\n🔗 {link}" if link else "⚠️ No pude crear el evento.")
+                else:
+                    link = create_calendar_task(text, parsed, tz)
+                    send_message(chat_id, f"✅ Tarea creada ({tz}):\n🔗 {link}" if link else "⚠️ No pude crear la tarea.")
+            else:
+                send_message(chat_id, "⚠️ No encontré fecha u hora en tu audio.")
+        except Exception as e:
+            print(f"❌ Error procesando audio: {e}")
+            send_message(chat_id, f"❌ Error interno: {e}")
 
-            if parsed_time:
-                if event_type == "evento":
-                    link = create_calendar_event(text, pars
+    return {"ok": True}
+
+# -------------------------------------------------------------
+# RUTA PRINCIPAL
+# -------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "🤖 Bot Telegram + Whisper + Calendar con zona horaria automática 🚀"}
