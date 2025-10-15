@@ -1,0 +1,5 @@
+__pycache__/
+*.ogg
+token.json
+google_credentials.json
+.env
