@@ -14,7 +14,8 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
 
 # URL del modelo gratuito de Whisper
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/openai/whisper-tiny"
+HF_MODEL_URL = "https://api-inference.huggingface.co/models/openai/whisper-tiny.en"
+
 
 # --- Función auxiliar para transcribir usando Hugging Face ---
 def transcribir_audio(chat_id, file_url):
@@ -116,3 +117,4 @@ async def telegram_webhook(request: Request):
     except Exception as e:
         print("⚠️ Error general en webhook:", e)
         return {"ok": False, "error": str(e)}
+
