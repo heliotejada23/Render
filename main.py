@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -9,9 +10,7 @@ from zoneinfo import ZoneInfo
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 import dateparser
-
-import re
-from datetime import datetime
+from dateparser.search import search_dates
 
 # -------------------------------------------------------------
 # CONFIGURACIÓN
@@ -20,7 +19,7 @@ TELEGRAM_API = os.getenv("TELEGRAM_API")
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
 HF_MODEL_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
 
-# Carga de credenciales de Google
+# Google creds (desde env o token.json)
 GOOGLE_TOKEN = os.getenv("GOOGLE_TOKEN_JSON")
 if GOOGLE_TOKEN:
     creds = Credentials.from_authorized_user_info(json.loads(GOOGLE_TOKEN))
@@ -29,12 +28,14 @@ else:
         creds = Credentials.from_authorized_user_info(json.load(f))
 
 calendar_service = build("calendar", "v3", credentials=creds)
+
+# Fallback TZ si no podemos leerla de Google
 DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Europe/Madrid")
 
 app = FastAPI()
 
 # -------------------------------------------------------------
-# FUNCIONES AUXILIARES
+# TELEGRAM
 # -------------------------------------------------------------
 def send_message(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_API}/sendMessage"
@@ -52,6 +53,9 @@ def download_file(file_id: str) -> bytes:
         raise Exception(f"Error al descargar audio: {resp.status_code}")
     return resp.content
 
+# -------------------------------------------------------------
+# WHISPER (Hugging Face)
+# -------------------------------------------------------------
 def transcribe_audio(audio_data: bytes) -> str:
     resp = requests.post(
         HF_MODEL_URL,
@@ -74,7 +78,7 @@ def transcribe_audio(audio_data: bytes) -> str:
 # ZONA HORARIA
 # -------------------------------------------------------------
 def get_user_timezone() -> str:
-    """Obtiene la zona horaria del usuario desde Google Calendar"""
+    """Lee la timezone de tu cuenta de Google Calendar; usa DEFAULT_TZ si falla."""
     try:
         settings = calendar_service.settings().get(setting='timezone').execute()
         tz = settings.get("value")
@@ -85,28 +89,49 @@ def get_user_timezone() -> str:
     return DEFAULT_TZ
 
 # -------------------------------------------------------------
-# DETECCIÓN DE FECHAS Y TAREAS
+# NLP de fecha/hora + limpieza de título
 # -------------------------------------------------------------
-def parse_datetime_from_text(text: str, tz: str) -> datetime | None:
-    """
-    Detecta fecha/hora en español con tolerancia a errores y expresiones comunes.
-    """
-    original_text = text
-    text = text.lower()
+SPANISH_FIXES = {
+    "manana": "mañana",
+    "pasado manana": "pasado mañana",
+    "miercoles": "miércoles",
+    "sabado": "sábado",
+}
 
-    # Correcciones básicas de palabras sin tilde
-    replacements = {
-        "manana": "mañana",
-        "pasado manana": "pasado mañana",
-        "miercoles": "miércoles",
-        "sabado": "sábado",
-    }
-    for wrong, correct in replacements.items():
-        text = text.replace(wrong, correct)
+TIME_WORDS = [
+    r"\b(hoy|mañana|pasado mañana)\b",
+    r"\b(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\b",
+    r"\b(a las|sobre las|hacia las|a la)\b\s*\d{1,2}([:.]\d{1,2})?\s*(am|pm|h|hs)?",
+    r"\b(\d{1,2}[:.]\d{2})\b\s*(am|pm|h|hs)?",
+    r"\b(\d{1,2})\s*(am|pm)\b",
+    r"\b(mañana|tarde|noche|mediodía|mediodia)\b",
+    r"\b(este|esta|el)\s+(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)\b",
+    r"\b(\d{1,2}\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre))\b",
+]
 
-    # Intento 1: usar dateparser normalmente
-    dt = dateparser.parse(
-        text,
+TIME_PATTERN = re.compile("|".join(TIME_WORDS), re.IGNORECASE)
+
+def normalize_spanish(text: str) -> str:
+    t = text.lower()
+    for wrong, correct in SPANISH_FIXES.items():
+        t = t.replace(wrong, correct)
+    # normalizar “mediodía”
+    t = t.replace("mediodia", "mediodía")
+    return t
+
+def extract_datetime_and_clean(text: str, tz: str):
+    """
+    Devuelve (dt, has_time, clean_title)
+    - dt: datetime con TZ si encuentra algo
+    - has_time: True si la expresión incluía hora
+    - clean_title: título sin la parte de fecha/hora
+    """
+    original = text.strip()
+    t = normalize_spanish(original)
+
+    # 1) busca todas las fechas/horas en el texto
+    results = search_dates(
+        t,
         languages=["es"],
         settings={
             "PREFER_DATES_FROM": "future",
@@ -114,46 +139,73 @@ def parse_datetime_from_text(text: str, tz: str) -> datetime | None:
             "RETURN_AS_TIMEZONE_AWARE": True,
         },
     )
-    if dt:
-        print(f"✅ dateparser reconoció fecha/hora: {dt}")
-        return dt
 
-    # Intento 2: expresiones comunes tipo "mañana", "pasado mañana"
-    now = datetime.now(ZoneInfo(tz))
-    if "pasado mañana" in text:
-        return now + timedelta(days=2)
-    if "mañana" in text:
-        return now + timedelta(days=1)
-    if "hoy" in text:
-        return now
+    chosen_dt = None
+    chosen_span = None
+    has_time = False
 
-    # Intento 3: día de la semana (“lunes”, “viernes”, etc.)
-    weekdays = {
-        "lunes": 0, "martes": 1, "miércoles": 2, "miercoles": 2,
-        "jueves": 3, "viernes": 4, "sábado": 5, "sabado": 5, "domingo": 6
-    }
-    for day_name, day_num in weekdays.items():
-        if day_name in text:
-            days_ahead = (day_num - now.weekday() + 7) % 7
-            if days_ahead == 0:
-                days_ahead = 7
-            target = now + timedelta(days=days_ahead)
-            print(f"✅ Detectado día de la semana: {day_name} → {target}")
-            return target
+    if results:
+        # results = [(matched_substring, datetime_obj), ...]
+        # preferimos la primera que contenga hora explícita
+        for match_text, dt in results:
+            # ¿la subcadena trae hora?
+            if re.search(r"\d{1,2}([:.]\d{1,2})?\s*(am|pm|h|hs)?", match_text):
+                chosen_dt = dt
+                chosen_span = match_text
+                has_time = True
+                break
+        # si ninguna traía hora, cogemos la primera (será fecha sola)
+        if chosen_dt is None:
+            chosen_dt = results[0][1]
+            chosen_span = results[0][0]
+            has_time = False
 
-    # Intento 4: hora simple (“a las 9”, “a las 10:30”)
-    match = re.search(r"a las (\d{1,2})(?:[:\.](\d{1,2}))?", text)
-    if match:
-        hour = int(match.group(1))
-        minute = int(match.group(2)) if match.group(2) else 0
-        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if candidate < now:
-            candidate += timedelta(days=1)
-        print(f"✅ Detectada hora sin fecha: {candidate}")
-        return candidate
+    # 2) Si no encontró nada, heurísticas básicas
+    if chosen_dt is None:
+        now = datetime.now(ZoneInfo(tz))
+        if "pasado mañana" in t:
+            chosen_dt = now + timedelta(days=2)
+            chosen_span = "pasado mañana"
+        elif "mañana" in t:
+            chosen_dt = now + timedelta(days=1)
+            chosen_span = "mañana"
+        elif "hoy" in t:
+            chosen_dt = now
+            chosen_span = "hoy"
+        # has_time sigue False aquí
 
-    print(f"⚠️ No se encontró fecha/hora en: {original_text}")
-    return None
+    # 3) Si detectamos “mediodía/tarde/noche” sin hora, ajustamos
+    if chosen_dt is not None and not has_time:
+        if "mediodía" in t:
+            chosen_dt = chosen_dt.replace(hour=12, minute=0, second=0, microsecond=0)
+            has_time = True
+        elif "tarde" in t:
+            chosen_dt = chosen_dt.replace(hour=16, minute=0, second=0, microsecond=0)
+            has_time = True
+        elif "noche" in t:
+            chosen_dt = chosen_dt.replace(hour=20, minute=0, second=0, microsecond=0)
+            has_time = True
+
+    # 4) limpieza del título: elimina la porción de fecha/hora detectada
+    clean_title = original
+    if chosen_span:
+        # quitar solo esa porción (case-insensitive, espacios sobrantes)
+        clean_title = re.sub(re.escape(chosen_span), "", clean_title, flags=re.IGNORECASE)
+        # quitar conectores típicos cercanos a la hora/fecha
+        clean_title = re.sub(r"\b(a las|sobre las|hacia las|el|este|esta|para|de)\b", "", clean_title, flags=re.IGNORECASE)
+        # colapsar espacios
+        clean_title = re.sub(r"\s{2,}", " ", clean_title).strip(" :,-")
+
+    # 5) si al limpiar quedó vacío, usa un fallback
+    if not clean_title:
+        clean_title = "Tarea" if not has_time else "Evento"
+
+    # 6) asegurar TZ awareness
+    if chosen_dt is not None and chosen_dt.tzinfo is None:
+        chosen_dt = chosen_dt.replace(tzinfo=ZoneInfo(tz))
+
+    print(f"🧪 extract_datetime_and_clean → dt={chosen_dt}, has_time={has_time}, title='{clean_title}'")
+    return chosen_dt, has_time, clean_title
 
 def classify_intent(text: str) -> str:
     t = text.lower()
@@ -161,21 +213,13 @@ def classify_intent(text: str) -> str:
         return "task"
     if any(w in t for w in ["reunión", "cita", "evento", "llamada", "videollamada", "quedar"]):
         return "event"
+    # por defecto: si hay hora → evento; si no → tarea
     return "event"
 
-def ensure_time(dt: datetime | None, tz: str, default_hour: int = 9, default_minute: int = 0) -> datetime | None:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ZoneInfo(tz))
-    if dt.hour == 0 and dt.minute == 0 and dt.second == 0:
-        dt = dt.replace(hour=default_hour, minute=default_minute)
-    return dt
-
 # -------------------------------------------------------------
-# CREACIÓN DE EVENTOS Y TAREAS
+# CALENDAR
 # -------------------------------------------------------------
-def create_calendar_event(summary: str, start_dt: datetime, tz: str, duration_minutes: int = 30) -> str | None:
+def create_calendar_event(summary: str, start_dt: datetime, tz: str, duration_minutes: int = 60) -> str | None:
     try:
         end_dt = start_dt + timedelta(minutes=duration_minutes)
         body = {
@@ -191,6 +235,10 @@ def create_calendar_event(summary: str, start_dt: datetime, tz: str, duration_mi
         return None
 
 def create_calendar_task(summary: str, due_dt: datetime, tz: str) -> str | None:
+    """
+    Si due_dt trae hora → bloque con hora exacta.
+    Si no trae hora → evento de día completo.
+    """
     try:
         if due_dt.hour == 0 and due_dt.minute == 0 and due_dt.second == 0:
             body = {
@@ -199,7 +247,7 @@ def create_calendar_task(summary: str, due_dt: datetime, tz: str) -> str | None:
                 "end": {"date": (due_dt.date() + timedelta(days=1)).isoformat()},
             }
         else:
-            end_dt = due_dt + timedelta(minutes=30)
+            end_dt = due_dt + timedelta(minutes=60)
             body = {
                 "summary": f"Tarea: {summary.strip().capitalize()}",
                 "start": {"dateTime": due_dt.isoformat(), "timeZone": tz},
@@ -213,14 +261,14 @@ def create_calendar_task(summary: str, due_dt: datetime, tz: str) -> str | None:
         return None
 
 # -------------------------------------------------------------
-# TELEGRAM
+# TELEGRAM: MODELO
 # -------------------------------------------------------------
 class TelegramUpdate(BaseModel):
     update_id: int
     message: dict
 
 # -------------------------------------------------------------
-# WEBHOOK TELEGRAM
+# WEBHOOK
 # -------------------------------------------------------------
 @app.post("/webhook")
 async def telegram_webhook(update: TelegramUpdate):
@@ -235,21 +283,22 @@ async def telegram_webhook(update: TelegramUpdate):
     if "text" in message:
         text = message["text"].strip()
         intent = classify_intent(text)
-        parsed = parse_datetime_from_text(text, tz)
-        parsed = ensure_time(parsed, tz, 10 if intent == "event" else 9)
+        dt, has_time, clean_title = extract_datetime_and_clean(text, tz)
 
-        if parsed:
+        if dt:
             if intent == "event":
-                link = create_calendar_event(text, parsed, tz)
+                link = create_calendar_event(clean_title, dt, tz)
                 send_message(chat_id, f"📅 Evento creado ({tz}):\n🔗 {link}" if link else "⚠️ No pude crear el evento.")
             else:
-                link = create_calendar_task(text, parsed, tz)
+                link = create_calendar_task(clean_title, dt, tz)
                 send_message(chat_id, f"✅ Tarea creada ({tz}):\n🔗 {link}" if link else "⚠️ No pude crear la tarea.")
         else:
-            send_message(chat_id, "⚠️ No encontré fecha u hora. Dime algo como: 'reunión mañana a las 10'.")
+            send_message(chat_id, "⚠️ No encontré fecha u hora. Dime algo como: 'tarea mañana a las 8: pagar luz'.")
 
-    # --- Audio ---
-    elif "voice" in message:
+        return {"ok": True}
+
+    # --- Voz ---
+    if "voice" in message:
         try:
             send_message(chat_id, "🎧 Procesando tu nota de voz...")
             file_id = message["voice"]["file_id"]
@@ -259,30 +308,28 @@ async def telegram_webhook(update: TelegramUpdate):
                 send_message(chat_id, "⚠️ No pude transcribir el audio.")
                 return {"ok": True}
 
-            send_message(chat_id, f"🗣️ He entendido: {text}")
             intent = classify_intent(text)
-            parsed = parse_datetime_from_text(text, tz)
-            parsed = ensure_time(parsed, tz, 10 if intent == "event" else 9)
+            dt, has_time, clean_title = extract_datetime_and_clean(text, tz)
 
-            if parsed:
+            if dt:
                 if intent == "event":
-                    link = create_calendar_event(text, parsed, tz)
+                    link = create_calendar_event(clean_title, dt, tz)
                     send_message(chat_id, f"📅 Evento creado ({tz}):\n🔗 {link}" if link else "⚠️ No pude crear el evento.")
                 else:
-                    link = create_calendar_task(text, parsed, tz)
+                    link = create_calendar_task(clean_title, dt, tz)
                     send_message(chat_id, f"✅ Tarea creada ({tz}):\n🔗 {link}" if link else "⚠️ No pude crear la tarea.")
             else:
-                send_message(chat_id, "⚠️ No encontré fecha u hora en tu audio.")
+                send_message(chat_id, f"🗣️ Entendí: {text}\n⚠️ No encontré fecha u hora. Di: 'mañana a las 8 ...'")
+
         except Exception as e:
             print(f"❌ Error procesando audio: {e}")
-            send_message(chat_id, f"❌ Error interno: {e}")
+            send_message(chat_id, f"❌ Error: {e}")
 
     return {"ok": True}
 
 # -------------------------------------------------------------
-# RUTA PRINCIPAL
+# SALUD
 # -------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "🤖 Bot Telegram + Whisper + Calendar con zona horaria automática 🚀"}
-
+    return {"status": "ok", "message": "🤖 Bot Telegram + Whisper + Calendar con fechas/horas exactas y título limpio"}
