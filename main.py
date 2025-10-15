@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
+import dateparser
 
 # -------------------------------------------------------------
 # CONFIGURACIÓN
@@ -14,7 +15,6 @@ TELEGRAM_API = os.getenv("TELEGRAM_API")
 HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
 HF_MODEL_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
 
-# Token de Google Calendar (puede venir del entorno o archivo)
 GOOGLE_TOKEN = os.getenv("GOOGLE_TOKEN_JSON")
 if GOOGLE_TOKEN:
     creds = Credentials.from_authorized_user_info(json.loads(GOOGLE_TOKEN))
@@ -72,25 +72,36 @@ def transcribe_audio(audio_data: bytes):
         text = result[0]["text"]
     return text or ""
 
-def detect_event_info(text: str):
-    """Detecta si el texto incluye un evento o recordatorio simple"""
-    text_lower = text.lower()
-    event = None
+# -------------------------------------------------------------
+# INTELIGENCIA DE FECHAS Y TAREAS
+# -------------------------------------------------------------
+def parse_datetime_from_text(text: str):
+    """Detecta fecha y hora en lenguaje natural (en español)"""
+    parsed_date = dateparser.parse(
+        text,
+        languages=["es"],
+        settings={"PREFER_DATES_FROM": "future"}
+    )
+    return parsed_date
 
-    # Ejemplos básicos de detección
-    if "reunión" in text_lower or "cita" in text_lower or "recordatorio" in text_lower:
-        start_time = datetime.utcnow() + timedelta(minutes=1)
-        end_time = start_time + timedelta(minutes=30)
-        event = {
-            "summary": text.capitalize(),
-            "start": {"dateTime": start_time.isoformat() + "Z"},
-            "end": {"dateTime": end_time.isoformat() + "Z"},
-        }
-    return event
+def detect_event_type(text: str):
+    """Determina si es evento o tarea"""
+    t = text.lower()
+    if any(w in t for w in ["reunión", "cita", "evento", "llamada", "videollamada", "entrega"]):
+        return "evento"
+    elif any(w in t for w in ["recordatorio", "tarea", "hacer", "pendiente"]):
+        return "tarea"
+    return "evento"  # Por defecto
 
-def create_calendar_event(event):
+def create_calendar_event(summary, start_time):
     """Crea un evento en Google Calendar"""
     try:
+        end_time = start_time + timedelta(minutes=30)
+        event = {
+            "summary": summary.capitalize(),
+            "start": {"dateTime": start_time.isoformat(), "timeZone": "Europe/Madrid"},
+            "end": {"dateTime": end_time.isoformat(), "timeZone": "Europe/Madrid"},
+        }
         created = calendar_service.events().insert(calendarId="primary", body=event).execute()
         print(f"✅ Evento creado: {created.get('htmlLink')}")
         return created.get("htmlLink")
@@ -98,15 +109,30 @@ def create_calendar_event(event):
         print(f"⚠️ Error al crear evento: {e}")
         return None
 
+def create_calendar_task(summary, due_time):
+    """Crea una tarea como evento de día completo"""
+    try:
+        event = {
+            "summary": f"Tarea: {summary.capitalize()}",
+            "start": {"date": due_time.date().isoformat()},
+            "end": {"date": (due_time.date() + timedelta(days=1)).isoformat()},
+        }
+        created = calendar_service.events().insert(calendarId="primary", body=event).execute()
+        print(f"✅ Tarea creada: {created.get('htmlLink')}")
+        return created.get("htmlLink")
+    except Exception as e:
+        print(f"⚠️ Error al crear tarea: {e}")
+        return None
+
 # -------------------------------------------------------------
-# MODELOS
+# ESTRUCTURA TELEGRAM
 # -------------------------------------------------------------
 class TelegramUpdate(BaseModel):
     update_id: int
     message: dict
 
 # -------------------------------------------------------------
-# WEBHOOK DE TELEGRAM
+# WEBHOOK TELEGRAM
 # -------------------------------------------------------------
 @app.post("/webhook")
 async def telegram_webhook(update: TelegramUpdate):
@@ -114,54 +140,45 @@ async def telegram_webhook(update: TelegramUpdate):
     chat_id = message["chat"]["id"]
     print(f"📩 Mensaje recibido: {message}")
 
+    # --- Mensaje de texto ---
     if "text" in message:
         text = message["text"]
-        send_message(chat_id, f"📝 Has dicho: {text}")
+        send_message(chat_id, f"📝 Entendido: {text}")
 
-        # Detectar comandos de evento
-        event = detect_event_info(text)
-        if event:
-            link = create_calendar_event(event)
-            if link:
-                send_message(chat_id, f"📅 Evento creado correctamente.\n🔗 {link}")
+        event_type = detect_event_type(text)
+        parsed_time = parse_datetime_from_text(text)
+
+        if parsed_time:
+            if event_type == "evento":
+                link = create_calendar_event(text, parsed_time)
+                send_message(chat_id, f"📅 Evento creado: {link}")
             else:
-                send_message(chat_id, "⚠️ No pude crear el evento en el calendario.")
-        return {"ok": True}
+                link = create_calendar_task(text, parsed_time)
+                send_message(chat_id, f"✅ Tarea añadida al calendario: {link}")
+        else:
+            send_message(chat_id, "⚠️ No encontré una fecha u hora en tu mensaje.")
 
+    # --- Mensaje de voz ---
     elif "voice" in message:
         voice = message["voice"]
         file_id = voice["file_id"]
         duration = voice.get("duration", 0)
 
-        if duration > 10:
-            send_message(chat_id, "🎧 Audio largo, procesando... dame unos segundos ⏳")
-        else:
-            send_message(chat_id, "🎧 Transcribiendo tu nota de voz...")
+        send_message(chat_id, "🎧 Procesando tu nota de voz...")
 
         try:
             audio_data = download_file(file_id)
             text = transcribe_audio(audio_data)
 
-            if text:
-                send_message(chat_id, f"🎙️ Texto detectado: {text}")
-                event = detect_event_info(text)
-                if event:
-                    link = create_calendar_event(event)
-                    if link:
-                        send_message(chat_id, f"📅 Evento añadido al calendario:\n🔗 {link}")
-                    else:
-                        send_message(chat_id, "⚠️ No pude añadir el evento al calendario.")
-            else:
-                send_message(chat_id, "⚠️ No pude extraer texto del audio.")
-        except Exception as e:
-            print(f"❌ Error procesando audio: {e}")
-            send_message(chat_id, f"❌ Error al procesar el audio: {e}")
+            if not text:
+                send_message(chat_id, "⚠️ No pude transcribir el audio.")
+                return {"ok": True}
 
-    return {"ok": True}
+            send_message(chat_id, f"🗣️ He entendido: {text}")
 
-# -------------------------------------------------------------
-# RUTA PRINCIPAL
-# -------------------------------------------------------------
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "🤖 Bot Telegram + Whisper + Google Calendar activo 🚀"}
+            event_type = detect_event_type(text)
+            parsed_time = parse_datetime_from_text(text)
+
+            if parsed_time:
+                if event_type == "evento":
+                    link = create_calendar_event(text, pars
